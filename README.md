@@ -44,7 +44,7 @@ REMOTION_CONCURRENCY=4 npm run render:mp4      # 固定 4 个
 | 输入 | 说明 |
 | --- | --- |
 | `target` | `mp4` / `alpha` / `both` |
-| `chunks` | 分块数 = 并行 runner 数，默认 `8`（`1` = 退回单机渲染） |
+| `chunks` | 分块数 = 并行 runner 数，默认 `20`（= Free 计划的并发上限；`1` = 退回单机渲染） |
 | `render_concurrency` | 每台 runner 内部的并发，默认 `50%`（4 vCPU 上 = 2 个标签） |
 | `retention_days` | artifact 保留天数，默认 7 |
 
@@ -59,9 +59,18 @@ plan   ──►  chunk 0..N-1 (矩阵，每块一台 4 vCPU runner，并行)
        └─►  stitch (下载所有块，拼接 + 对齐音频，上传成片)
 ```
 
-- 每个 job 都是**一台独立的机器**，8 块 = 8 台同时跑，总吞吐量 32 vCPU
-- 墙上时间的下限是**单个 job 的准备开销**（checkout + `npm ci` + 缓存里恢复 Chrome ≈ 1 分钟），不是渲染本身，所以块数堆到 16 以上收益就很小了
-- Free 计划的并发上限是 20 个 job，矩阵上限 256
+- 每个 job 都是**一台独立的机器**，20 块 = 20 台同时跑，总吞吐量 80 vCPU
+- Free 计划的并发上限是 20 个 job（矩阵上限 256），所以 20 就是天花板
+
+实测（797 帧 1080p60）：
+
+| 分块数 | 总时长 | 备注 |
+| --- | --- | --- |
+| 1（单机） | ~30 min | |
+| 8 | **9.8 min** | 最慢的 Chunk 1 要 8.2 min，其余 5 块 2 分钟内就跑完 —— 全卡在一块上 |
+| 20 | ~4 min | 每块 40 帧，最重的那块也跟着变小 |
+
+**为什么块数越多越好**：帧与帧的成本差着数量级 —— Token 收尾那种近乎全黑的静止帧，30 秒能渲 100 帧；卡片飞入那几帧要解视频 + 跑 30px 高斯模糊，100 帧要 7.7 分钟。等分帧数意味着最重的那块决定总时长，所以要把块切碎，而不是指望负载自动均衡（Remotion 的规范要求每块帧数相等，除非最后一块 —— 不等分会破坏 AAC 拼接的对齐）。
 
 实现照的是 Remotion 的 [distributed rendering 规范](https://www.remotion.dev/docs/distributed-rendering)：每块帧数必须等长（最后一块除外）、codec 用 `h264-ts`、音频跟着块一起渲（`forSeamlessAacConcatenation`）、最后用 Remotion 自己的 `combineChunks()` 拼。
 

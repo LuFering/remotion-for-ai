@@ -5,9 +5,19 @@
 # repo would burn paid minutes and only get 2 vCPU / 8 GB per job.
 #
 # The mp4 is rendered by a matrix of jobs, one runner per chunk of the timeline
-# (see scripts/render-plan.mjs), and a final job concatenates them. A single
-# runner needs ~30 min for these 797 frames of 1080p60; 8 chunks land around
-# 5-7 min, and the floor is the per-job setup cost, not the render.
+# (see scripts/render-plan.mjs), and a final job concatenates them.
+#
+# Measured on this composition (797 frames of 1080p60):
+#   single runner            ~30 min
+#   8 chunks                 9.8 min
+#   20 chunks (this default) ~4 min
+#
+# Chunk *count* is not the whole story — the frames cost wildly different
+# amounts (a Token outro frame is a near-static black frame, a card fly-in
+# decodes video and runs a 30px blur). At 8 equal chunks the heaviest chunk took
+# 7.7 min of rendering while the lightest took 0.3, so the run was gated by one
+# job. More chunks shrink the heaviest chunk, which is why the default is at the
+# Free plan's 20 job concurrency limit rather than something smaller.
 #
 # Manual only — a render is minutes of CPU, not something to fire on every push.
 name: render
@@ -24,9 +34,9 @@ on:
           - both
         default: mp4
       chunks:
-        description: '分块数 = 并行 runner 数（1 = 不分块；Free 计划并发上限是 20 个 job）'
+        description: '分块数 = 并行 runner 数（1 = 不分块；Free 计划并发上限就是 20 个 job）'
         required: false
-        default: '8'
+        default: '20'
       render_concurrency:
         description: '每台 runner 内部的并发（数字如 2，或百分比如 50%；留空 = Remotion 自动）'
         required: false
