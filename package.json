@@ -11,7 +11,10 @@
     "render": "node render.mjs out/AlbumStack.mp4 --no-alpha",
     "render:mp4": "node render.mjs out/AlbumStack.mp4 --no-alpha",
     "render:alpha": "node render.mjs out/AlbumStackAlpha.mov",
-    "font:build": "node scripts/build-font.mjs"
+    "font:build": "node scripts/build-font.mjs",
+    "plan": "node scripts/render-plan.mjs",
+    "render:chunk": "node scripts/render-chunk.mjs",
+    "stitch": "node scripts/stitch.mjs"
   },
   "dependencies": {
     "@remotion/bundler": "4.0.509",

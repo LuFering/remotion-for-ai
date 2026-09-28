@@ -18,8 +18,16 @@ npm ci
 npm run studio        # 打开 Remotion Studio 预览
 npm run typecheck     # tsc --noEmit
 
-npm run render:mp4    # -> out/AlbumStack.mp4
+npm run render:mp4    # -> out/AlbumStack.mp4（单机）
 npm run render:alpha  # -> out/AlbumStackAlpha.mov
+```
+
+分布式渲染的三个步骤也能在本地跑（CI 就是这么调的）：
+
+```bash
+npm run plan                          # 打印分块方案
+CHUNK_INDEX=0 CHUNK_START=0 CHUNK_END=99 npm run render:chunk
+CHUNKS_DIR=out FRAMES_PER_CHUNK=100 DURATION_IN_FRAMES=797 FPS=60 npm run stitch
 ```
 
 `REMOTION_CONCURRENCY` 控制并行渲染的浏览器标签数，默认是 CPU 线程数的一半：
@@ -36,10 +44,32 @@ REMOTION_CONCURRENCY=4 npm run render:mp4      # 固定 4 个
 | 输入 | 说明 |
 | --- | --- |
 | `target` | `mp4` / `alpha` / `both` |
-| `render_concurrency` | 并发数或百分比，默认 `50%`（4 vCPU 上 = 2 个标签） |
+| `chunks` | 分块数 = 并行 runner 数，默认 `8`（`1` = 退回单机渲染） |
+| `render_concurrency` | 每台 runner 内部的并发，默认 `50%`（4 vCPU 上 = 2 个标签） |
 | `retention_days` | artifact 保留天数，默认 7 |
 
 渲染完成后在 run 页面的 **Artifacts** 里下载。
+
+### mp4 是分块并行渲染的
+
+一台 4 vCPU 的 runner 渲这 797 帧要 ~30 分钟，所以 mp4 走的是分布式渲染 —— 把时间轴切成等长的块，每块扔给一台独立的 runner，最后拼起来：
+
+```
+plan   ──►  chunk 0..N-1 (矩阵，每块一台 4 vCPU runner，并行)
+       └─►  stitch (下载所有块，拼接 + 对齐音频，上传成片)
+```
+
+- 每个 job 都是**一台独立的机器**，8 块 = 8 台同时跑，总吞吐量 32 vCPU
+- 墙上时间的下限是**单个 job 的准备开销**（checkout + `npm ci` + 缓存里恢复 Chrome ≈ 1 分钟），不是渲染本身，所以块数堆到 16 以上收益就很小了
+- Free 计划的并发上限是 20 个 job，矩阵上限 256
+
+实现照的是 Remotion 的 [distributed rendering 规范](https://www.remotion.dev/docs/distributed-rendering)：每块帧数必须等长（最后一块除外）、codec 用 `h264-ts`、音频跟着块一起渲（`forSeamlessAacConcatenation`）、最后用 Remotion 自己的 `combineChunks()` 拼。
+
+**踩到的坑**：`combineChunks()` 用 `-c:a copy` 直接封装 AAC，于是第一块的编码器 priming（2048 采样 @48kHz = 43ms）会留在成片里，整条音轨比画面晚 43ms。`render.mjs` 里那段注释说的就是同一个毛病（单机渲染时 Remotion 的 mp4 muxer 会写出 `media_time = 0` 的 edit list）。所以 `scripts/stitch.mjs` 拼接完会再做一次和 `render.mjs` 一样的处理：砍掉 2048 个采样重新编码音频。实测修完以后音轨和单机渲染的版本完全对齐（对 `main.wav` 的互相关 lag 都是 `+0ms`）。
+
+`alpha` 那条路**没有**分块：`combineChunks()` 只能无重编码地拼 h264，而带 alpha 的 ProRes 重编码不敢赌，所以透明母版还是单机渲染。
+
+### 为什么用公开仓库
 
 ### 为什么用公开仓库
 
@@ -56,7 +86,8 @@ GitHub 托管的 runner 规格按仓库可见性区分（[官方文档](https://
 
 其他注意事项：
 
-- 单个 job 上限 6 小时，workflow 里设了 `timeout-minutes: 120`。
+- 单个 job 上限 6 小时；chunk job 设了 `timeout-minutes: 120`，alpha 设了 300。
+- 每块的产物（`.ts` + `.aac`，100 帧约 0.2–1.7 MB）作为 artifact 传给 stitch job，公开仓库的 artifact 存储不另计费。
 - runner 上没有 GPU，Remotion 默认用 Chrome Headless Shell 做纯 CPU 渲染，这个合成不需要 GPU。
 - `node_modules/.remotion`（Chrome Headless Shell，约 150 MB）在 workflow 里做了缓存。
 - `alpha` 版 mov 约 330 MB，artifact 上传会比较慢，只在真的需要透明素材时才选它。
