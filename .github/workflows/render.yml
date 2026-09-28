@@ -7,17 +7,26 @@
 # The mp4 is rendered by a matrix of jobs, one runner per chunk of the timeline
 # (see scripts/render-plan.mjs), and a final job concatenates them.
 #
-# Measured on this composition (797 frames of 1080p60):
-#   single runner            ~30 min
-#   8 chunks                 9.8 min
-#   20 chunks (this default) ~4 min
+# Measured on this composition (797 frames of 1080p60, on a Free plan account):
 #
-# Chunk *count* is not the whole story — the frames cost wildly different
-# amounts (a Token outro frame is a near-static black frame, a card fly-in
-# decodes video and runs a 30px blur). At 8 equal chunks the heaviest chunk took
-# 7.7 min of rendering while the lightest took 0.3, so the run was gated by one
-# job. More chunks shrink the heaviest chunk, which is why the default is at the
-# Free plan's 20 job concurrency limit rather than something smaller.
+#   single runner            ~30 min
+#   8 chunks                  9.8 min   gated by the heaviest chunk (8.2 min)
+#   10 chunks (this default)  7.6 min   heaviest chunk 6.8 min
+#   20 chunks                 9.7 min   no gain — see the concurrency note below
+#
+# Two things set the number:
+#
+#   * The account gets **6 concurrent jobs**, not the 20 the Free plan docs
+#     advertise (measured: concurrency climbs to 6 and then a new job only
+#     starts when one finishes). So the floor is total work / 6, and every
+#     extra chunk adds its own setup (~0.5 min) to that total.
+#
+#   * Frames cost wildly different amounts. Frames 0-439 (cards flying in,
+#     decoding video, hero clip, camera moves) are 93% of the render work;
+#     frames 440+ (the Token outro — black frames with a word on them) are 7%.
+#     Since Remotion requires equal frame counts per chunk, the heaviest chunk
+#     sets the floor. ~10 chunks is where the heaviest chunk stops being the
+#     bottleneck and the per-job setup starts being one.
 #
 # Manual only — a render is minutes of CPU, not something to fire on every push.
 name: render
@@ -34,9 +43,9 @@ on:
           - both
         default: mp4
       chunks:
-        description: '分块数 = 并行 runner 数（1 = 不分块；Free 计划并发上限就是 20 个 job）'
+        description: '分块数（1 = 不分块；实测最优是 10，见文件顶部注释）'
         required: false
-        default: '20'
+        default: '10'
       render_concurrency:
         description: '每台 runner 内部的并发（数字如 2，或百分比如 50%；留空 = Remotion 自动）'
         required: false
