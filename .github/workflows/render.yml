@@ -1,0 +1,135 @@
+# Renders AlbumStack on a GitHub-hosted Linux runner.
+#
+# This workflow is meant for a PUBLIC repository: public repos get the 4 vCPU /
+# 16 GB `ubuntu-latest` runner for free and without a minutes quota, while the
+# same label on a private repo only gets 2 vCPU / 8 GB out of your paid minutes.
+#
+# Manual only — a render is minutes of CPU, not something to fire on every push.
+# Add a `push:` trigger below if you want it on every commit to src/ + public/.
+name: render
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '渲染目标'
+        type: choice
+        options:
+          - mp4
+          - alpha
+          - both
+        default: mp4
+      render_concurrency:
+        description: '并发（数字如 2，或百分比如 50%；留空 = Remotion 自动）'
+        required: false
+        default: '50%'
+      retention_days:
+        description: 'artifact 保留天数 (1-90)'
+        required: false
+        default: '7'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    name: Render AlbumStack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      # Two sets of packages, both required:
+      #   * ffmpeg — render.mjs re-muxes the mp4 with it to drop the AAC
+      #     priming samples, and the Ubuntu runner image does not ship it.
+      #   * Chrome Headless Shell's shared libraries, otherwise it dies with
+      #     "error while loading shared libraries: libnspr4.so".
+      #     List from https://www.remotion.dev/docs/miscellaneous/linux-dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ffmpeg \
+            libnss3 \
+            libdbus-1-3 \
+            libatk1.0-0 \
+            libasound2t64 \
+            libxrandr2 \
+            libxkbcommon-dev \
+            libxfixes3 \
+            libxcomposite1 \
+            libxdamage1 \
+            libgbm-dev \
+            libcups2 \
+            libcairo2 \
+            libpango-1.0-0 \
+            libatk-bridge2.0-0
+
+      - run: npm ci --loglevel=error
+
+      # Remotion downloads Chrome Headless Shell (~150 MB) into
+      # node_modules/.remotion on first use. Cache it or pay for the download
+      # on every run.
+      - name: Cache Chrome Headless Shell
+        uses: actions/cache@v6
+        with:
+          path: node_modules/.remotion
+          key: remotion-browser-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Ensure Chrome Headless Shell
+        run: npx remotion browser ensure
+
+      # 50% of a 4-vCPU runner = 2 tabs. The composition is heavy (1080p60,
+      # software GL, a 30px blur in the Token reveal) and a single render
+      # already keeps ~9 threads busy at concurrency 4, so filling all four
+      # vCPUs with tabs mostly makes them fight the encoder. Raise this only if
+      # you have benchmarked it: `npx remotion benchmark` locally.
+      - name: Render mp4 (h264 + aac)
+        if: inputs.target == 'mp4' || inputs.target == 'both'
+        env:
+          REMOTION_CONCURRENCY: ${{ inputs.render_concurrency }}
+        run: node render.mjs out/AlbumStack.mp4 --no-alpha
+
+      - name: Render alpha (ProRes 4444 .mov)
+        if: inputs.target == 'alpha' || inputs.target == 'both'
+        env:
+          REMOTION_CONCURRENCY: ${{ inputs.render_concurrency }}
+        run: node render.mjs out/AlbumStackAlpha.mov
+
+      - name: Report output
+        if: always()
+        run: |
+          shopt -s nullglob
+          for f in out/AlbumStack.mp4 out/AlbumStackAlpha.mov; do
+            [ -f "$f" ] || continue
+            echo "== $f"
+            ls -lh "$f"
+            ffprobe -v error -show_entries format=duration,size -show_entries stream=codec_name,width,height,r_frame_rate -of default=noprint_wrappers=1 "$f"
+          done
+
+      - name: Upload mp4
+        if: inputs.target == 'mp4' || inputs.target == 'both'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AlbumStack-mp4-${{ github.run_number }}
+          path: out/AlbumStack.mp4
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+
+      # ~330 MB for 13s: ProRes 4444 at 1080p60 is heavy. Only pick `alpha`
+      # when you actually need the transparent master.
+      - name: Upload alpha
+        if: inputs.target == 'alpha' || inputs.target == 'both'
+        uses: actions/upload-artifact@v7
+        with:
+          name: AlbumStack-alpha-${{ github.run_number }}
+          path: out/AlbumStackAlpha.mov
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
