@@ -1,0 +1,221 @@
+# 视频语音转文字 —— 用 whisper.cpp（C++ 版，纯 CPU，不依赖 torch）
+#
+# ══ 为什么用 whisper.cpp 而不是 openai-whisper ══
+# Python 版会拖下来好几个 GB 的 torch，而这个 workflow 只需要转写。
+# whisper.cpp 是纯 C++，编译约 1 分钟，模型是单个文件，好缓存。
+#
+# ══ 为什么分块 ══
+# 免费 runner 每个 job 只有 4 核（公库）。要快，只能**切段并行**：
+# 一段音频切成 N 块，每块一个 job，最后一个 job 合并。
+#
+# ⚠️ 切块必须**重叠**（`overlap` 秒）。
+# 不重叠的话，切口处的词会因上下文断裂而识别错；
+# 重叠之后再按时间戳去重，接缝才干净。
+#
+# ══ 实测参数（第一次跑完记得回来改这一行）══
+#   单 job 全片          约 ?? min
+#   N 块                  约 ?? min
+# 先按 6 块起（账号并发上限一般是 6），跑一次看实测再调。
+name: transcribe
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '音频/视频文件（仓库内相对路径，如 public/audio.mp4）'
+        required: true
+      model:
+        description: 'whisper 模型（越大越准越慢）'
+        type: choice
+        options: [tiny, base, small, medium, large-v3-turbo]
+        default: small
+      language:
+        description: '语言（zh / en / auto）'
+        default: 'zh'
+      chunks:
+        description: '分块数（1 = 不分块）'
+        default: '6'
+      overlap:
+        description: '相邻块重叠秒数（防止切口处识别错）'
+        default: '5'
+      retention_days:
+        description: 'artifact 保留天数 (1-90)'
+        default: '14'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── ① 计划：把音频切成几块，算出每块的起止时间 ──
+  plan:
+    name: Plan chunks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+      duration: ${{ steps.plan.outputs.duration }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: 探测时长并切块
+        id: plan
+        env:
+          SRC: ${{ inputs.source }}
+          N: ${{ inputs.chunks }}
+          OVERLAP: ${{ inputs.overlap }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$SRC" ]; then echo "找不到文件：$SRC"; exit 1; fi
+          # 只取音频流转成 16k 单声道 wav —— whisper 要的就是这个格式
+          ffmpeg -y -loglevel error -i "$SRC" -vn -ac 1 -ar 16000 -c:a pcm_s16le /tmp/full.wav
+          DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 /tmp/full.wav)
+          echo "duration=$DUR" >> "$GITHUB_OUTPUT"
+          # node 是子进程，看不到 shell 变量 —— 必须 export
+          export DUR
+
+          # ⚠️ 分块用 node 算，注意 DUR/N/OVERLAP 已经在上面这个 step 的 env 里
+          node -e '
+            const dur = parseFloat(process.env.DUR ?? "0");
+            const n = Math.max(1, parseInt(process.env.N ?? "1", 10));
+            const ov = parseFloat(process.env.OVERLAP ?? "5");
+            const seg = dur / n;
+            const chunks = [];
+            for (let i = 0; i < n; i++) {
+              const start = Math.max(0, i * seg - (i > 0 ? ov : 0));
+              const end = Math.min(dur, (i + 1) * seg + (i < n - 1 ? ov : 0));
+              if (end - start < 1) continue;          // 太短的块丢掉
+              chunks.push({index: i, start: +start.toFixed(2), end: +end.toFixed(2)});
+            }
+            console.log("分块：", JSON.stringify(chunks));
+            if (chunks.length === 0) { console.error("切出来 0 块，检查音频时长"); process.exit(1); }
+            require("fs").appendFileSync(process.env.GITHUB_OUTPUT,
+              `chunks=${JSON.stringify(chunks)}\n`);
+          '
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: audio-full
+          path: /tmp/full.wav
+          retention-days: 1
+
+  # ── ② 转写：每个块一个 job，并行 ──
+  transcribe:
+    name: Chunk ${{ matrix.chunk.index }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 ffmpeg 与编译工具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg build-essential cmake
+
+      - name: 缓存 whisper.cpp
+        id: cache-wc
+        uses: actions/cache@v6
+        with:
+          path: whisper.cpp
+          key: whispercpp-v1-${{ runner.os }}
+
+      - name: 编译 whisper.cpp
+        if: steps.cache-wc.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/ggml-org/whisper.cpp
+          cd whisper.cpp
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DWHISPER_NO_ACCELERATE=ON
+          cmake --build build --config Release -j"$(nproc)"
+
+      - name: 缓存模型
+        id: cache-model
+        uses: actions/cache@v6
+        with:
+          path: models
+          key: whisper-model-${{ inputs.model }}-v1
+
+      - name: 下载模型
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          bash whisper.cpp/models/download-ggml-model.sh ${{ inputs.model }} models
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: audio-full
+          path: /tmp
+
+      - name: 切出本块
+        env:
+          S: ${{ matrix.chunk.start }}
+          E: ${{ matrix.chunk.end }}
+        run: |
+          set -euo pipefail
+          # -ss/-to 放在 -i 前后都行，这里放前面（快，直接从关键帧跳）
+          ffmpeg -y -loglevel error -ss "$S" -to "$E" -i /tmp/full.wav -c copy /tmp/chunk.wav
+          # whisper 的时间戳是"块内相对时间"，合并时要加上本块起点
+          echo "$S" > /tmp/chunk-start.txt
+
+      - name: 转写
+        run: |
+          set -euo pipefail
+          ./whisper.cpp/build/bin/whisper-cli \
+            -m models/ggml-${{ inputs.model }}.bin \
+            -f /tmp/chunk.wav \
+            -l ${{ inputs.language }} \
+            --output-srt --output-json --output-txt \
+            --output-file /tmp/chunk \
+            -t "$(nproc)"
+          ls -la /tmp/chunk*
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: chunk-${{ matrix.chunk.index }}
+          path: |
+            /tmp/chunk.srt
+            /tmp/chunk.json
+            /tmp/chunk.txt
+            /tmp/chunk-start.txt
+          retention-days: ${{ inputs.retention_days }}
+
+  # ── ③ 合并：按时间戳拼起来，重叠部分去重 ──
+  stitch:
+    name: Stitch
+    needs: [plan, transcribe]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: chunk-*
+          merge-multiple: false
+          path: /tmp/chunks
+
+      - name: 合并
+        run: |
+          node scripts/stitch-srt.mjs /tmp/chunks ${{ inputs.overlap }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: transcript
+          path: |
+            /tmp/out/*.srt
+            /tmp/out/*.txt
+            /tmp/out/*.md
+          retention-days: ${{ inputs.retention_days }}
